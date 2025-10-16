@@ -134,26 +134,34 @@ class T330Reader:
         
         # Retry up to 10 times, looking for version string pattern "Nb+"
         for rpr_cnt in range(10, 0, -1):
+            attempt_num = 11 - rpr_cnt
+            _LOGGER.debug("T330: sequence 1 attempt %d/10", attempt_num)
+            
             resp = self._write_and_read(conn, seq, read_size=50, tries=1, pad_zeros=200)
             if resp:
                 _LOGGER.debug("T330: received %d bytes: %s", len(resp), resp.hex())
                 
                 # Check if response is all zeros (indicates no real communication)
                 if resp == b'\x00' * len(resp):
-                    _LOGGER.debug("T330: received all-zero response, meter not responding (attempt %d/10)", 11-rpr_cnt)
-                # Check for expected version string pattern in response
+                    _LOGGER.debug("T330: received all-zero response, meter not responding (attempt %d/10)", attempt_num)
+                    # Continue to next attempt
+                # Check for expected version string pattern in response  
                 elif b"Nb+" in resp:
                     _LOGGER.debug("T330: version string found! Continue...")
                     return
                 else:
-                    _LOGGER.debug("T330: received data but no 'Nb+' pattern found (attempt %d/10)", 11-rpr_cnt)
+                    _LOGGER.debug("T330: received data but no 'Nb+' pattern found (attempt %d/10)", attempt_num)
+                    # Continue to next attempt
             else:
-                _LOGGER.debug("T330: no response received (attempt %d/10)", 11-rpr_cnt)
+                _LOGGER.debug("T330: no response received (attempt %d/10)", attempt_num)
             
             # Add a delay between attempts
             if rpr_cnt > 1:  # Don't delay after the last attempt
+                _LOGGER.debug("T330: waiting 0.5s before next attempt...")
                 time.sleep(0.5)
         
+        # If we get here, all 10 attempts failed
+        _LOGGER.error("T330: All 10 sequence 1 attempts failed - version string not found")
         raise RuntimeError("T330: Version string not found. Exiting...")
 
     def _sequence_2(self, conn: Serial) -> None:
