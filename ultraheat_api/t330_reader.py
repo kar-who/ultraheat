@@ -101,7 +101,7 @@ class T330Reader:
         # perl tries 10 times, with large zero padding before the frame
         resp = self._write_and_read(conn, seq, read_size=50, tries=10, pad_zeros=200)
         if resp:
-            _LOGGER.debug("T330: sequence 1 response: %s", resp.hex())
+            _LOGGER.debug("T330: sequence 1 response (%d bytes): %s", len(resp), resp.hex())
             return
         else:
             _LOGGER.error("T330: sequence 1 - no response, cannot establish communication")
@@ -111,11 +111,43 @@ class T330Reader:
         # Application reset (CI 0x50), expect single-char 0xE5 within response
         seq = bytes([0x68, 0x04, 0x04, 0x68, 0x53, 0xFE, 0x50, 0x00, 0xA1, 0x16])
         _LOGGER.debug("T330: sequence 2 - application reset")
-        # perl tries 5 times with padding
-        resp = self._write_and_read(conn, seq, read_size=50, tries=5, pad_zeros=200)
-        if b"\xE5" in resp:
-            _LOGGER.debug("T330: E5 ACK received")
-            return
+        
+        # Try multiple approaches with increasing timeouts and retries
+        for attempt in range(3):
+            _LOGGER.debug("T330: sequence 2 attempt %d/3", attempt + 1)
+            
+            # Increase tries and padding on subsequent attempts
+            tries = 5 + (attempt * 2)  # 5, 7, 9 tries
+            pad_zeros = 200 + (attempt * 100)  # 200, 300, 400 zeros
+            
+            resp = self._write_and_read(conn, seq, read_size=50, tries=tries, pad_zeros=pad_zeros)
+            
+            if resp:
+                _LOGGER.debug("T330: sequence 2 response (attempt %d): %s", attempt + 1, resp.hex())
+                
+                # Check for E5 ACK in multiple ways
+                if b"\xE5" in resp or b"\xe5" in resp:
+                    _LOGGER.debug("T330: E5 ACK received in response")
+                    return
+                
+                # Check each byte individually for 0xE5
+                for i, byte_val in enumerate(resp):
+                    if byte_val == 0xE5:
+                        _LOGGER.debug("T330: E5 ACK found at position %d", i)
+                        return
+                
+                # Log what we actually got
+                _LOGGER.debug("T330: no E5 (0xE5) found in response, got bytes: %s", [hex(b) for b in resp])
+            else:
+                _LOGGER.debug("T330: sequence 2 attempt %d - no response", attempt + 1)
+            
+            # Progressive delay between attempts
+            if attempt < 2:
+                delay = 0.3 + (attempt * 0.2)
+                _LOGGER.debug("T330: waiting %.1fs before next attempt", delay)
+                time.sleep(delay)
+        
+        _LOGGER.error("T330: no E5 ACK after all attempts (sequence 2)")
         raise RuntimeError("T330: no E5 ACK (sequence 2)")
 
     def _sequence_3(self, conn: Serial) -> None:
