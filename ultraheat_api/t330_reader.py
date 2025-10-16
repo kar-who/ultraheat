@@ -23,11 +23,11 @@ class T330Reader:
         self,
         port: str,
         timeout: float = 2.0,
-        retries: int = 3,
+        max_attempts: int = 3,
     ) -> None:
         self._port = port
         self.timeout = timeout
-        self.retries = retries
+        self.max_attempts = max_attempts
 
     def read(self) -> Tuple[str, bytes]:
         with self._connect_serial(baudrate=2400) as conn:
@@ -57,19 +57,19 @@ class T330Reader:
             rtscts=0,
         )
 
-    def _write_and_read(self, conn: Serial, payload: bytes, read_size: int, tries: int, pad_zeros: int = 0) -> bytes:
+    def _write_and_read(self, conn: Serial, payload: bytes, read_size: int, max_attempts: int, pad_zeros: int = 0) -> bytes:
         """
         Write with optional zero padding (perl sends long runs of 0x00 before frames),
-        then read up to read_size, retrying tries times with short backoff.
+        then read up to read_size, retrying max_attempts times with short backoff.
         """
         zero_pad = b"\x00" * pad_zeros if pad_zeros > 0 else b""
-        for attempt in range(tries):
+        for attempt in range(max_attempts):
             _LOGGER.debug(
                 "T330: sending %d+%d bytes (attempt %s/%s)",
                 len(zero_pad),
                 len(payload),
                 attempt + 1,
-                tries,
+                max_attempts,
             )
             conn.reset_input_buffer()
             conn.reset_output_buffer()
@@ -90,7 +90,7 @@ class T330Reader:
                 _LOGGER.debug("T330: no response received")
             # backoff between retries (perl loops without long sleep; keep conservative)
             time.sleep(0.3)
-        _LOGGER.debug("T330: exhausted %d attempts, no response", tries)
+        _LOGGER.debug("T330: exhausted %d attempts, no response", max_attempts)
         return b""
 
     def _wake_up_meter(self, conn: Serial) -> None:
@@ -131,8 +131,8 @@ class T330Reader:
         for attempt in range(10):
             _LOGGER.debug("T330: sequence 1 attempt %d/10", attempt + 1)
             
-            # Use fewer internal retries since we're doing our own retry loop
-            resp = self._write_and_read(conn, seq, read_size=50, tries=2, pad_zeros=200)
+            # Use fewer internal attempts since we're doing our own retry loop
+            resp = self._write_and_read(conn, seq, read_size=50, max_attempts=2, pad_zeros=200)
             
             if resp:
                 _LOGGER.debug("T330: sequence 1 response (%d bytes): %s", len(resp), resp.hex())
@@ -167,11 +167,11 @@ class T330Reader:
         for attempt in range(3):
             _LOGGER.debug("T330: sequence 2 attempt %d/3", attempt + 1)
             
-            # Increase tries and padding on subsequent attempts
-            tries = 5 + (attempt * 2)  # 5, 7, 9 tries
+            # Increase attempts and padding on subsequent tries
+            max_write_attempts = 5 + (attempt * 2)  # 5, 7, 9 attempts
             pad_zeros = 200 + (attempt * 100)  # 200, 300, 400 zeros
             
-            resp = self._write_and_read(conn, seq, read_size=50, tries=tries, pad_zeros=pad_zeros)
+            resp = self._write_and_read(conn, seq, read_size=50, max_attempts=max_write_attempts, pad_zeros=pad_zeros)
             
             if resp:
                 _LOGGER.debug("T330: sequence 2 response (attempt %d): %s", attempt + 1, resp.hex())
@@ -221,8 +221,8 @@ class T330Reader:
             ]
         )
         _LOGGER.debug("T330: sequence 3 - SND_UD with payload")
-        # perl tries 2 times with padding; accept any non-empty reply
-        resp = self._write_and_read(conn, seq, read_size=50, tries=2, pad_zeros=200)
+        # perl attempts 2 times with padding; accept any non-empty reply
+        resp = self._write_and_read(conn, seq, read_size=50, max_attempts=2, pad_zeros=200)
         if resp:
             _LOGGER.debug("T330: sequence 3 response len=%d", len(resp))
             return
@@ -233,7 +233,7 @@ class T330Reader:
         seq = bytes([0x10, 0x7C, 0xFE, 0x7A, 0x16])  # perl "working" frame
         _LOGGER.debug("T330: sequence 5 - short frame to switch baud to 9600")
         # one attempt is sufficient; still prepend zeros like perl arrays
-        _ = self._write_and_read(conn, seq, read_size=5, tries=1, pad_zeros=200)
+        _ = self._write_and_read(conn, seq, read_size=5, max_attempts=1, pad_zeros=200)
 
         # Allow meter to switch
         _LOGGER.debug("T330: waiting 1.5s for meter to switch baudrate")
