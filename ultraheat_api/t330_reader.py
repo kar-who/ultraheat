@@ -126,20 +126,37 @@ class T330Reader:
             ]
         )
         _LOGGER.debug("T330: sequence 1 - read version string")
-        # perl tries 10 times, with large zero padding before the frame
-        resp = self._write_and_read(conn, seq, read_size=50, tries=10, pad_zeros=200)
-        if resp:
-            _LOGGER.debug("T330: sequence 1 response (%d bytes): %s", len(resp), resp.hex())
+        
+        # Try multiple times and validate each response
+        for attempt in range(10):
+            _LOGGER.debug("T330: sequence 1 attempt %d/10", attempt + 1)
             
-            # Check if response is all zeros (indicates meter not ready for M-Bus)
-            if all(b == 0 for b in resp):
-                _LOGGER.error("T330: sequence 1 - meter responding with all zeros (not ready for M-Bus)")
-                raise RuntimeError("T330: meter not ready for M-Bus communication - check optical alignment and meter state")
+            # Use fewer internal retries since we're doing our own retry loop
+            resp = self._write_and_read(conn, seq, read_size=50, tries=2, pad_zeros=200)
             
-            return
-        else:
-            _LOGGER.error("T330: sequence 1 - no response, cannot establish communication")
-            raise RuntimeError("T330: no response from sequence 1 - meter not responding")
+            if resp:
+                _LOGGER.debug("T330: sequence 1 response (%d bytes): %s", len(resp), resp.hex())
+                
+                # Check if response is all zeros (indicates meter not ready for M-Bus)
+                if all(b == 0 for b in resp):
+                    _LOGGER.debug("T330: sequence 1 attempt %d - meter responding with all zeros", attempt + 1)
+                    # Don't return or raise yet - try again
+                else:
+                    # Got a valid (non-zero) response
+                    _LOGGER.debug("T330: sequence 1 success - got valid response")
+                    return
+            else:
+                _LOGGER.debug("T330: sequence 1 attempt %d - no response", attempt + 1)
+            
+            # Add progressive delay between attempts
+            if attempt < 9:  # Don't sleep after the last attempt
+                delay = 0.2 + (attempt * 0.1)
+                _LOGGER.debug("T330: waiting %.1fs before next attempt", delay)
+                time.sleep(delay)
+        
+        # If we get here, all attempts failed
+        _LOGGER.error("T330: sequence 1 failed after 10 attempts - meter not ready for M-Bus communication")
+        raise RuntimeError("T330: meter not ready for M-Bus communication after 10 attempts - check optical alignment and meter state")
 
     def _sequence_2(self, conn: Serial) -> None:
         # Application reset (CI 0x50), expect single-char 0xE5 within response
