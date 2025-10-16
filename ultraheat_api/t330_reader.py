@@ -1,16 +1,25 @@
 """
-Reader for Landis+Gyr T330 over optical M-Bus, following the proven perl flow.
+T330 Heat Meter Serial Communication Module
 
-Assumptions impacting behavior:
-- Serial params: start at 2400 baud, 8E1; after short-frame speed switch, read at 9600 baud, 8E1.
-- Timing: conservative sleeps and limited retries similar to the perl script. Too-aggressive polling may yield no response.
-- We only collect a short burst of frames (~2 seconds) after switching to 9600. Users with slow meters may need to increase timeout.
+This module implements the communication protocol for Landis+Gyr T330 heat meters.
+The communication follows a specific sequence:
 
-This reader returns (model, raw_bytes). The model is set to "T330".
+1. Send version string request to establish communication
+2. Send application reset command and wait for confirmation (0xE5 response)
+3. Send SND_UD payload to initiate data transfer
+4. Send baud rate switch command
+5. Switch to 9600 baud and collect M-Bus data frames
+
+Serial Configuration:
+- Initial: 2400 baud, 8 data bits, Even parity, 1 stop bit
+- Final: 9600 baud, 8 data bits, Even parity, 1 stop bit
+- Timeouts: 1500ms for handshake sequences, 2000ms for data collection
 """
 import logging
 import time
 from typing import Tuple
+from datetime import datetime
+from pathlib import Path
 
 import serial
 from serial import Serial
@@ -19,24 +28,41 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class T330Reader:
+    """
+    T330 Heat Meter Serial Communication Reader
+    
+    Implements the communication protocol for Landis+Gyr T330 heat meters
+    over serial/optical interface. Handles the complete handshake sequence
+    and data collection process.
+    """
+    
     def __init__(
         self,
         port: str,
         timeout: float = 2.0,
         retries: int = 3,
     ) -> None:
+        """
+        Initialize T330 reader.
+        
+        Args:
+            port: Serial port path (e.g., '/dev/ttyUSB0', 'COM3')
+            timeout: Communication timeout in seconds
+            retries: Number of retry attempts for failed operations
+        """
         self._port = port
         self.timeout = timeout
         self.retries = retries
 
     def read(self) -> Tuple[str, bytes]:
+        """Execute the complete T330 communication sequence and return raw M-Bus data."""
         with self._connect_serial(baudrate=2400) as conn:
-            # Match perl read_const_time of 1500 ms during sequences 1-3
+            # Set timeout for handshake sequences (1.5 seconds minimum)
             conn.timeout = max(1.5, float(self.timeout))
-            self._sequence_1(conn)
-            self._sequence_2(conn)
-            self._sequence_3(conn)
-            raw_bytes = self._sequence_5_and_read(conn)
+            self._sequence_1(conn)  # Version string request
+            self._sequence_2(conn)  # Application reset
+            self._sequence_3(conn)  # SND_UD payload
+            raw_bytes = self._sequence_5_and_read(conn)  # Baud switch and data collection
         return "T330", raw_bytes
 
     def _connect_serial(self, baudrate: int) -> Serial:
@@ -47,14 +73,23 @@ class T330Reader:
             parity=serial.PARITY_EVEN,
             stopbits=serial.STOPBITS_ONE,
             timeout=self.timeout,
-            xonxoff=0,
-            rtscts=0,
+            xonxoff=False,
+            rtscts=False,
         )
 
     def _write_and_read(self, conn: Serial, payload: bytes, read_size: int, tries: int, pad_zeros: int = 0) -> bytes:
         """
-        Write with optional zero padding (perl sends long runs of 0x00 before frames),
-        then read up to read_size, retrying tries times with short backoff.
+        Send a command frame to the meter and read the response.
+        
+        Args:
+            conn: Serial connection to the meter
+            payload: Command bytes to send
+            read_size: Maximum bytes to read in response
+            tries: Number of retry attempts
+            pad_zeros: Number of null bytes to send before the payload (meter synchronization)
+        
+        Returns:
+            Response bytes from the meter, or empty bytes if no response
         """
         zero_pad = b"\x00" * pad_zeros if pad_zeros > 0 else b""
         for attempt in range(tries):
@@ -73,7 +108,7 @@ class T330Reader:
             if written != len(payload):
                 _LOGGER.debug("T330: partial write %s/%s", written, len(payload))
             conn.flush()
-            # perl immediately listens; keep a tiny settle time
+            # Brief settling time to allow meter to process command
             time.sleep(0.01)
             _LOGGER.debug("T330: waiting for response (max %d bytes)", read_size)
             data = conn.read(read_size)
@@ -82,115 +117,183 @@ class T330Reader:
                 return data
             else:
                 _LOGGER.debug("T330: no response received")
-            # backoff between retries (perl loops without long sleep; keep conservative)
+            # Wait between retry attempts
             time.sleep(0.3)
         _LOGGER.debug("T330: exhausted %d attempts, no response", tries)
         return b""
 
     def _sequence_1(self, conn: Serial) -> None:
-        # Long frame: "Read version string" (CI 0x51) as in perl rd_t330.pl
-        seq = bytes(
-            [
-                # a lot of leading zeros were used; they are not required electrically, keep minimal
-                0x68, 0x05, 0x05, 0x68, 0x73, 0xFE, 0x51, 0x0F, 0x0F, 0xE0, 0x16,
-            ]
-        )
+        """
+        Sequence 1: Request version string from the meter.
+        
+        Sends a version string request command and waits for a response containing "Nb+" 
+        which indicates the meter is responding correctly.
+        """
+        seq = bytes([0x68, 0x05, 0x05, 0x68, 0x73, 0xFE, 0x51, 0x0F, 0x0F, 0xE0, 0x16])
         _LOGGER.debug("T330: sequence 1 - read version string")
-        # perl tries 10 times, with large zero padding before the frame
-        resp = self._write_and_read(conn, seq, read_size=50, tries=10, pad_zeros=200)
-        if resp:
-            _LOGGER.debug("T330: sequence 1 response: %s", resp)
-        else:
-            _LOGGER.debug("T330: sequence 1 - no response")
-        # Do not strictly require matching ASCII pattern; meters differ. Proceed if any response observed.
+        
+        # Retry up to 10 times, looking for version string pattern "Nb+"
+        for rpr_cnt in range(10, 0, -1):
+            resp = self._write_and_read(conn, seq, read_size=50, tries=1, pad_zeros=200)
+            if resp:
+                _LOGGER.debug("T330: received %d bytes: %s", len(resp), resp.hex())
+                
+                # Check if response is all zeros (indicates no real communication)
+                if resp == b'\x00' * len(resp):
+                    _LOGGER.debug("T330: received all-zero response, meter not responding (attempt %d/10)", 11-rpr_cnt)
+                # Check for expected version string pattern in response
+                elif b"Nb+" in resp:
+                    _LOGGER.debug("T330: version string found! Continue...")
+                    return
+                else:
+                    _LOGGER.debug("T330: received data but no 'Nb+' pattern found (attempt %d/10)", 11-rpr_cnt)
+            else:
+                _LOGGER.debug("T330: no response received (attempt %d/10)", 11-rpr_cnt)
+            
+            # Add a delay between attempts
+            if rpr_cnt > 1:  # Don't delay after the last attempt
+                time.sleep(0.5)
+        
+        raise RuntimeError("T330: Version string not found. Exiting...")
 
     def _sequence_2(self, conn: Serial) -> None:
-        # Application reset (CI 0x50), expect single-char 0xE5 within response
+        """
+        Sequence 2: Send application reset command.
+        
+        Resets the meter's application layer and waits for confirmation byte 0xE5.
+        """
         seq = bytes([0x68, 0x04, 0x04, 0x68, 0x53, 0xFE, 0x50, 0x00, 0xA1, 0x16])
         _LOGGER.debug("T330: sequence 2 - application reset")
-        # perl tries 5 times with padding
-        resp = self._write_and_read(conn, seq, read_size=50, tries=5, pad_zeros=200)
-        if b"\xE5" in resp:
-            _LOGGER.debug("T330: E5 ACK received")
-            return
-        raise RuntimeError("T330: no E5 ACK (sequence 2)")
+        
+        # Retry up to 5 times, looking for confirmation byte 0xE5
+        for rpr_cnt in range(5, 0, -1):
+            resp = self._write_and_read(conn, seq, read_size=50, tries=1, pad_zeros=200)
+            if resp:
+                _LOGGER.debug("T330: received %d bytes", len(resp))
+                if b"\xE5" in resp:
+                    _LOGGER.debug("T330: Character E5 found! Continue...")
+                    return
+            _LOGGER.debug("T330: listen, try %d", rpr_cnt)
+        
+        raise RuntimeError("T330: E5 not found. Exiting...")
 
     def _sequence_3(self, conn: Serial) -> None:
-        # SND_UD with payload 0x0F,0x70,0x00,0x01 (per perl)
-        seq = bytes(
-            [
-                0x68,
-                0x07,
-                0x07,
-                0x68,
-                0x73,
-                0xFE,
-                0x51,
-                0x0F,
-                0x70,
-                0x00,
-                0x01,
-                0x42,
-                0x16,
-            ]
-        )
+        """
+        Sequence 3: Send SND_UD (Send User Data) command.
+        
+        Initiates the data transfer session with the meter. Expects an 11-byte response.
+        """
+        seq = bytes([0x68, 0x07, 0x07, 0x68, 0x73, 0xFE, 0x51, 0x0F, 0x70, 0x00, 0x01, 0x42, 0x16])
         _LOGGER.debug("T330: sequence 3 - SND_UD with payload")
-        # perl tries 2 times with padding; accept any non-empty reply
-        resp = self._write_and_read(conn, seq, read_size=50, tries=2, pad_zeros=200)
-        if resp:
-            _LOGGER.debug("T330: sequence 3 response len=%d", len(resp))
-            return
-        raise RuntimeError("T330: no response (sequence 3)")
+        
+        # Retry up to 2 times, expecting exactly 11 bytes in response
+        for rpr_cnt in range(2, 0, -1):
+            resp = self._write_and_read(conn, seq, read_size=50, tries=1, pad_zeros=200)
+            if resp:
+                _LOGGER.debug("T330: received %d bytes", len(resp))
+                if len(resp) == 11:
+                    _LOGGER.debug("T330: 11 characters found! Continue...")
+                    return
+            _LOGGER.debug("T330: listen, try %d", rpr_cnt)
+        
+        raise RuntimeError("T330: 11-char response not found. Exiting...")
 
     def _sequence_5_and_read(self, conn: Serial) -> bytes:
-        # Short frame to switch baud to 9600, then reconfigure port and read a burst
-        seq = bytes([0x10, 0x7C, 0xFE, 0x7A, 0x16])  # perl "working" frame
+        """
+        Sequence 5: Send baud rate switch command and collect M-Bus data.
+        
+        Sends a short frame to signal baud rate change, then switches to 9600 baud
+        and collects all available M-Bus data frames from the meter.
+        """
+        seq = bytes([0x10, 0x7C, 0xFE, 0x7A, 0x16])
         _LOGGER.debug("T330: sequence 5 - short frame to switch baud to 9600")
-        # one attempt is sufficient; still prepend zeros like perl arrays
-        _ = self._write_and_read(conn, seq, read_size=5, tries=1, pad_zeros=200)
-
-        # Allow meter to switch
+        
+        # Send command with padding, no response expected at this baud rate
+        zero_pad = b"\x00" * 200
+        conn.reset_input_buffer()
+        conn.reset_output_buffer()
+        conn.write(zero_pad)
+        count_out = conn.write(seq)
+        conn.flush()
+        _LOGGER.debug("T330: written %d bytes", count_out)
+        if count_out != len(seq):
+            _LOGGER.warning("T330: write incomplete")
+        
+        # Wait for meter to switch baud rate
         _LOGGER.debug("T330: waiting 1.5s for meter to switch baudrate")
         time.sleep(1.5)
 
-        # Switch local UART to 9600 8E1 and read with ~2.0s per attempt
-        _LOGGER.debug("T330: switching local UART to 9600 baud, 8E1")
+        # Switch local UART to match meter's new baud rate (9600 8E1)
         conn.baudrate = 9600
-        conn.bytesize = serial.EIGHTBITS
         conn.parity = serial.PARITY_EVEN
+        conn.bytesize = serial.EIGHTBITS
         conn.stopbits = serial.STOPBITS_ONE
-        conn.timeout = 2.0  # perl: read_const_time(2000)
-        conn.reset_input_buffer()
-        conn.reset_output_buffer()
+        conn.timeout = 2.0  # 2 second timeout for data collection
+        conn.xonxoff = False
+        conn.rtscts = False
+        _LOGGER.debug("T330: switched to %d baud", conn.baudrate)
 
-        # perl reads up to 10000 bytes; loops while (count==10000) or (count==0 && retries left)
-        max_chunk = 10000
-        retries_left = 4
+        # Collect all M-Bus data frames from the meter
+        # Continue reading until no more data is available
         buffer = bytearray()
-        total = 0
+        chars = 0
+        zero_count_streak = 0
+        
         while True:
-            _LOGGER.debug("T330: reading up to %d bytes (retries left: %d)", max_chunk, retries_left)
-            chunk = conn.read(max_chunk)
-            n = len(chunk)
-            if n > 0:
+            _LOGGER.debug("T330: attempting to read data")
+            chunk = conn.read(10000)  # Read up to 10KB at a time
+            count = len(chunk)
+            
+            if count > 0:
                 buffer.extend(chunk)
-                total += n
-                _LOGGER.debug("T330: received %d bytes, total=%d", n, total)
-                # If exactly max_chunk, perl loops again immediately
-                if n == max_chunk:
-                    continue
-                # If less than max_chunk, give a brief moment for trailing bytes
-                time.sleep(0.05)
+                chars += count
+                zero_count_streak = 0  # Reset consecutive no-data count
+                _LOGGER.debug("T330: received %d total bytes", chars)
+                # Continue reading when data is received - more may be available
+                continue
             else:
-                retries_left -= 1
-                if retries_left <= 0:
+                # No data received in this read attempt
+                zero_count_streak += 1
+                _LOGGER.debug("T330: no data, consecutive empty reads: %d", zero_count_streak)
+                
+                # Stop after multiple consecutive empty reads (meter finished sending)
+                if zero_count_streak >= 10:
                     break
-                # No data this attempt; try again after short backoff
-                time.sleep(0.05)
+                    
+                # Brief wait before next read attempt
+                time.sleep(0.1)
+                continue
 
-        _LOGGER.debug("T330: collected %d bytes after baud switch", len(buffer))
-        if buffer:
-            _LOGGER.debug("T330: raw data sample (first 100 bytes): %s", bytes(buffer[:100]).hex())
+        _LOGGER.debug("T330: collected %d bytes of M-Bus data", len(buffer))
+        # Save debug capture when DEBUG logging is enabled
+        self._dump_debug_capture(bytes(buffer))
         return bytes(buffer)
+
+    def _dump_debug_capture(self, data: bytes) -> None:
+        """
+        Save raw M-Bus data to a timestamped file for debugging purposes.
+        
+        Only writes files when DEBUG logging is enabled. Files are saved to the tests/ 
+        directory with format: LGUT330_YYYYMMDD_HHMM.bin
+        
+        Args:
+            data: Raw M-Bus bytes received from the meter
+        """
+        if not data:
+            return
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            project_root = Path(__file__).resolve().parent.parent
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            filename = f"LGUT330_{ts}.bin"
+            out_path = tests_dir / filename
+            with open(out_path, "wb") as f:
+                f.write(data)
+            _LOGGER.debug("T330: wrote debug capture to %s (%d bytes)", out_path, len(data))
+        except Exception as e:
+            _LOGGER.debug("T330: failed to write debug capture: %s", e)
 
 
