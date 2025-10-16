@@ -33,6 +33,10 @@ class T330Reader:
         with self._connect_serial(baudrate=2400) as conn:
             # Match perl read_const_time of 1500 ms during sequences 1-3
             conn.timeout = max(1.5, float(self.timeout))
+            
+            # Add wake-up sequence - some meters need this
+            self._wake_up_meter(conn)
+            
             self._sequence_1(conn)
             time.sleep(0.1)  # Brief pause between sequences
             self._sequence_2(conn)
@@ -89,6 +93,30 @@ class T330Reader:
         _LOGGER.debug("T330: exhausted %d attempts, no response", tries)
         return b""
 
+    def _wake_up_meter(self, conn: Serial) -> None:
+        """Send wake-up sequence to activate meter's optical interface."""
+        _LOGGER.debug("T330: sending wake-up sequence")
+        
+        # Clear buffers first
+        conn.reset_input_buffer()
+        conn.reset_output_buffer()
+        
+        # Send long sequence of zeros followed by a break pattern (common M-Bus wake-up)
+        wake_up_zeros = b"\x00" * 500  # Extended wake-up pattern
+        wake_up_break = b"\xFF\xFF\xFF\xFF"  # Break pattern
+        
+        conn.write(wake_up_zeros)
+        conn.flush()
+        time.sleep(0.1)
+        
+        conn.write(wake_up_break)
+        conn.flush()
+        time.sleep(0.2)
+        
+        # Clear any responses to wake-up
+        conn.reset_input_buffer()
+        _LOGGER.debug("T330: wake-up sequence sent")
+
     def _sequence_1(self, conn: Serial) -> None:
         # Long frame: "Read version string" (CI 0x51) as in perl rd_t330.pl
         seq = bytes(
@@ -102,6 +130,12 @@ class T330Reader:
         resp = self._write_and_read(conn, seq, read_size=50, tries=10, pad_zeros=200)
         if resp:
             _LOGGER.debug("T330: sequence 1 response (%d bytes): %s", len(resp), resp.hex())
+            
+            # Check if response is all zeros (indicates meter not ready for M-Bus)
+            if all(b == 0 for b in resp):
+                _LOGGER.error("T330: sequence 1 - meter responding with all zeros (not ready for M-Bus)")
+                raise RuntimeError("T330: meter not ready for M-Bus communication - check optical alignment and meter state")
+            
             return
         else:
             _LOGGER.error("T330: sequence 1 - no response, cannot establish communication")
