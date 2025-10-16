@@ -103,6 +103,8 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self.validate_and_create_entry(self.dev_path, model)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
+            except NoResponse:
+                errors["base"] = "no_response"
 
         return self.async_show_form(
             step_id="model_selection",
@@ -112,9 +114,9 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def validate_and_create_entry(self, dev_path, model):
         """Try to connect to the device path and return an entry."""
-        device_number = await self.validate_ultraheat(dev_path, model)
+        validated_model, device_number = await self.validate_ultraheat(dev_path, model)
 
-        _LOGGER.debug("Got model %s and device_number %s", model, device_number)
+        _LOGGER.debug("Got model %s and device_number %s", validated_model, device_number)
         await self.async_set_unique_id(f"{device_number}")
         self._abort_if_unique_id_configured()
         data = {
@@ -127,7 +129,7 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
             data=data,
         )
 
-    async def validate_ultraheat(self, port: str, model: str) -> str:
+    async def validate_ultraheat(self, port: str, model: str) -> tuple[str, str]:
         """Validate the user input allows us to connect."""
 
         # Use the appropriate reader based on the model
@@ -145,6 +147,13 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
         except (TimeoutError, serial.SerialException) as err:
             _LOGGER.warning("Failed read data from: %s. %s", port, err)
             raise CannotConnect(f"Error communicating with device: {err}") from err
+        except RuntimeError as err:
+            _LOGGER.warning("Failed to communicate with meter: %s. %s", port, err)
+            # Check for specific T330 communication errors
+            if "no E5 ACK" in str(err) or "sequence" in str(err):
+                raise NoResponse(f"No response from meter. Please ensure the IR reader head is correctly positioned on the meter's optical interface and try again.") from err
+            else:
+                raise CannotConnect(f"Communication error with meter: {err}") from err
 
         _LOGGER.debug("Successfully connected to %s. Got data: %s", port, data)
         return data.model, data.device_number
@@ -175,3 +184,7 @@ async def get_usb_ports(hass: HomeAssistant) -> dict[str, str]:
 
 class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
+
+
+class NoResponse(HomeAssistantError):
+    """Error to indicate no response from the meter."""

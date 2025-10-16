@@ -13,7 +13,8 @@
       }
     },
     "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "no_response": "No response from meter. Please ensure the IR reader head is correctly positioned on the meter's optical interface and try again."
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
