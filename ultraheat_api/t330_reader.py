@@ -34,7 +34,9 @@ class T330Reader:
             # Match perl read_const_time of 1500 ms during sequences 1-3
             conn.timeout = max(1.5, float(self.timeout))
             self._sequence_1(conn)
+            time.sleep(0.1)  # Brief pause between sequences
             self._sequence_2(conn)
+            time.sleep(0.1)  # Brief pause between sequences
             self._sequence_3(conn)
             raw_bytes = self._sequence_5_and_read(conn)
         return "T330", raw_bytes
@@ -99,10 +101,11 @@ class T330Reader:
         # perl tries 10 times, with large zero padding before the frame
         resp = self._write_and_read(conn, seq, read_size=50, tries=10, pad_zeros=200)
         if resp:
-            _LOGGER.debug("T330: sequence 1 response: %s", resp)
+            _LOGGER.debug("T330: sequence 1 response: %s", resp.hex())
+            return
         else:
-            _LOGGER.debug("T330: sequence 1 - no response")
-        # Do not strictly require matching ASCII pattern; meters differ. Proceed if any response observed.
+            _LOGGER.error("T330: sequence 1 - no response, cannot establish communication")
+            raise RuntimeError("T330: no response from sequence 1 - meter not responding")
 
     def _sequence_2(self, conn: Serial) -> None:
         # Application reset (CI 0x50), expect single-char 0xE5 within response
