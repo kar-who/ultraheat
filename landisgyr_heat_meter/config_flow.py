@@ -105,6 +105,8 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except NoResponse:
                 errors["base"] = "no_response"
+            except T330CommunicationError:
+                errors["base"] = "t330_communication_error"
 
         return self.async_show_form(
             step_id="model_selection",
@@ -132,14 +134,31 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
     async def validate_ultraheat(self, port: str, model: str) -> tuple[str, str]:
         """Validate the user input allows us to connect."""
 
-        # Use the appropriate reader based on the model
-        if model == MODEL_T330:
-            reader = ultraheat_api.T330Reader(port=port, timeout=T330_TIMEOUT)
-        else:
-            reader = ultraheat_api.UltraheatReader(port=port, timeout=ULTRAHEAT_TIMEOUT)
+        # Temporarily enable DEBUG logging for detailed setup diagnostics
+        debug_loggers = [
+            logging.getLogger("ultraheat_api.t330_reader"),
+            logging.getLogger("ultraheat_api.mbus_t330"), 
+            logging.getLogger("ultraheat_api.service"),
+            logging.getLogger("ultraheat_api.ultraheat_reader"),
+        ]
+        original_levels = {}
+        
+        # Store original levels and set to DEBUG
+        for logger in debug_loggers:
+            original_levels[logger.name] = logger.level
+            logger.setLevel(logging.DEBUG)
+        
+        _LOGGER.info("Starting validation for %s meter at %s (debug logging enabled)", model, port)
 
-        heat_meter = ultraheat_api.HeatMeterService(reader)
         try:
+            # Use the appropriate reader based on the model
+            if model == MODEL_T330:
+                reader = ultraheat_api.T330Reader(port=port, timeout=T330_TIMEOUT)
+            else:
+                reader = ultraheat_api.UltraheatReader(port=port, timeout=ULTRAHEAT_TIMEOUT)
+
+            heat_meter = ultraheat_api.HeatMeterService(reader)
+            
             async with asyncio.timeout(ULTRAHEAT_TIMEOUT):
                 # validate and retrieve the model and device number for a unique id
                 data = await self.hass.async_add_executor_job(heat_meter.read)
@@ -149,13 +168,38 @@ class LandisgyrConfigFlow(ConfigFlow, domain=DOMAIN):
             raise CannotConnect(f"Error communicating with device: {err}") from err
         except RuntimeError as err:
             _LOGGER.warning("Failed to communicate with meter: %s. %s", port, err)
-            # Check for specific T330 communication errors
-            if "no E5 ACK" in str(err) or "sequence" in str(err):
-                raise NoResponse(f"No response from meter. Please ensure the IR reader head is correctly positioned on the meter's optical interface and try again.") from err
+            error_msg = str(err)
+            
+            # Provide specific error messages based on failure point
+            if "Version string not found" in error_msg:
+                raise T330CommunicationError(
+                    f"No initial response from meter. Please check: 1) IR reader is positioned correctly on meter's optical interface, "
+                    f"2) Meter display is active (press button if needed), 3) IR reader cable is properly connected."
+                ) from err
+            elif "no E5 ACK" in error_msg or "sequence 2" in error_msg:
+                raise T330CommunicationError(
+                    f"Meter handshake failed after initial contact. Please try: 1) Wait 10-15 seconds and retry, "
+                    f"2) Reposition IR reader for better optical contact, 3) Check for electrical interference, "
+                    f"4) Ensure meter is not busy with other operations."
+                ) from err
+            elif "11-char response not found" in error_msg or "sequence 3" in error_msg:
+                raise T330CommunicationError(
+                    f"Data transfer initialization failed. Please try: 1) Wait longer between attempts, "
+                    f"2) Check IR reader positioning, 3) Ensure meter has sufficient power/battery."
+                ) from err
             else:
                 raise CannotConnect(f"Communication error with meter: {err}") from err
 
-        _LOGGER.debug("Successfully connected to %s. Got data: %s", port, data)
+        except Exception as err:
+            _LOGGER.error("Unexpected error during validation: %s", err)
+            raise CannotConnect(f"Unexpected error: {err}") from err
+        
+        finally:
+            # Restore original logging levels
+            for logger in debug_loggers:
+                logger.setLevel(original_levels[logger.name])
+
+        _LOGGER.info("Successfully validated %s meter at %s. Device: %s", model, port, data.device_number)
         return data.model, data.device_number
 
 
@@ -188,3 +232,7 @@ class CannotConnect(HomeAssistantError):
 
 class NoResponse(HomeAssistantError):
     """Error to indicate no response from the meter."""
+
+
+class T330CommunicationError(HomeAssistantError):
+    """Error to indicate T330-specific communication issues with detailed troubleshooting."""

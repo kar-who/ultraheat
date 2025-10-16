@@ -14,7 +14,8 @@
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "no_response": "No response from meter. Please ensure the IR reader head is correctly positioned on the meter's optical interface and try again."
+      "no_response": "No response from meter. Please ensure the IR reader head is correctly positioned on the meter's optical interface and try again.",
+      "t330_communication_error": "T330 communication failed. Check the Home Assistant logs for detailed diagnostic information and follow the specific troubleshooting steps provided."
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
